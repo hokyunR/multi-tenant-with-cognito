@@ -11,6 +11,7 @@
     "cdk": "cdk"
   },
   "devDependencies": {
+    "@types/aws-lambda": "^8.10.136",
     "@types/jest": "^29.5.11",
     "@types/node": "20.10.4",
     "aws-cdk": "2.115.0",
@@ -20,6 +21,7 @@
     "typescript": "~5.3.3"
   },
   "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.525.0",
     "aws-cdk-lib": "2.115.0",
     "constructs": "^10.0.0",
     "source-map-support": "^0.5.21"
