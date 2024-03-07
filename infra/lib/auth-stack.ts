@@ -5,7 +5,7 @@ import * as lambda from "aws-cdk-lib/aws-lambda"
 import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs"
 import * as logs from "aws-cdk-lib/aws-logs"
 import * as sqs from "aws-cdk-lib/aws-sqs"
-import * as destinations from "aws-cdk-lib/aws-lambda-destinations"
+import * as eventSources from "aws-cdk-lib/aws-lambda-event-sources"
 import { Construct } from "constructs"
 
 export class AuthStack extends Stack {
@@ -21,8 +21,8 @@ export class AuthStack extends Stack {
         email: true,
       },
       customAttributes: {
-        userId: new cognito.StringAttribute({ minLen: 12, maxLen: 48, mutable: false }),
-        tenantId: new cognito.StringAttribute({ minLen: 12, maxLen: 48, mutable: false }),
+        userId: new cognito.StringAttribute({ minLen: 12, maxLen: 48, mutable: true }),
+        tenantId: new cognito.StringAttribute({ minLen: 12, maxLen: 48, mutable: true }),
       },
       // Only for development
       removalPolicy: RemovalPolicy.DESTROY,
@@ -43,7 +43,13 @@ export class AuthStack extends Stack {
       groupName: "User",
     })
 
-    const userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", { userPool })
+    const userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", {
+      userPool,
+      readAttributes: new cognito.ClientAttributes()
+        .withStandardAttributes({ email: true, emailVerified: true })
+        .withCustomAttributes("custom:userId", "custom:tenantId"),
+      writeAttributes: new cognito.ClientAttributes().withStandardAttributes({ email: true }),
+    })
 
     new CfnOutput(this, "user-pool-id", { value: userPool.userPoolId })
     new CfnOutput(this, "user-pool-client-id", { value: userPoolClient.userPoolClientId })
@@ -51,16 +57,35 @@ export class AuthStack extends Stack {
     this.userPool = userPool
 
     const deadLetterQueue = new sqs.Queue(this, "DeadLetterQueue")
-    const preSignUpLambda = new nodejs.NodejsFunction(this, "PreSignUpLambda", {
-      runtime: lambda.Runtime.NODEJS_18_X,
-      entry: path.join(__dirname, "../src/post-confirmation-trigger.ts"),
-      handler: "handler",
-      logRetention: logs.RetentionDays.ONE_MONTH,
-      onFailure: new destinations.SqsDestination(deadLetterQueue)
+    const preSignUpEventQueue = new sqs.Queue(this, "PreSignUpEventQueue", {
+      deadLetterQueue: {
+        maxReceiveCount: 1,
+        queue: deadLetterQueue,
+      },
     })
 
-    userPool.addTrigger(cognito.UserPoolOperation.POST_CONFIRMATION, preSignUpLambda)
+    const preSignUpTrigger = new nodejs.NodejsFunction(this, "PreSignUpTrigger", {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: path.join(__dirname, "../src/pre-sign-up-trigger.ts"),
+      handler: "handler",
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      environment: {
+        QUEUE_URL: preSignUpEventQueue.queueUrl,
+      },
+    })
+    preSignUpEventQueue.grantSendMessages(preSignUpTrigger)
+
+    const customAttributeHandler = new nodejs.NodejsFunction(this, "CustomAttributeHandler", {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: path.join(__dirname, "../src/custom-attribute-handler.ts"),
+      handler: "handler",
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      description: `Created at: ${new Date().toISOString()}`,
+    })
+    customAttributeHandler.addEventSource(new eventSources.SqsEventSource(preSignUpEventQueue))
+    preSignUpEventQueue.grantConsumeMessages(customAttributeHandler)
+    userPool.grant(customAttributeHandler, "cognito-idp:AdminUpdateUserAttributes")
+
+    userPool.addTrigger(cognito.UserPoolOperation.PRE_SIGN_UP, preSignUpTrigger)
   }
 }
-
-
