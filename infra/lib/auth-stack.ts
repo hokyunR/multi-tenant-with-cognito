@@ -4,8 +4,8 @@ import * as cognito from "aws-cdk-lib/aws-cognito"
 import * as lambda from "aws-cdk-lib/aws-lambda"
 import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs"
 import * as logs from "aws-cdk-lib/aws-logs"
-import * as sqs from "aws-cdk-lib/aws-sqs"
 import * as eventSources from "aws-cdk-lib/aws-lambda-event-sources"
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb"
 import { Construct } from "constructs"
 
 export class AuthStack extends Stack {
@@ -16,13 +16,16 @@ export class AuthStack extends Stack {
 
     const userPool = new cognito.UserPool(this, "UserPool", {
       userPoolName: "multi-tenant-user-pool",
+      // user can only be invited by admin
+      selfSignUpEnabled: false,
       accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
       signInAliases: {
         email: true,
       },
       customAttributes: {
-        userId: new cognito.StringAttribute({ minLen: 12, maxLen: 48, mutable: true }),
-        tenantId: new cognito.StringAttribute({ minLen: 12, maxLen: 48, mutable: true }),
+        user_id: new cognito.StringAttribute({ minLen: 1, maxLen: 128, mutable: true }),
+        tenant_id: new cognito.StringAttribute({ minLen: 1, maxLen: 128, mutable: true }),
+        company_name: new cognito.StringAttribute({ minLen: 1, maxLen: 128, mutable: true }),
       },
       // Only for development
       removalPolicy: RemovalPolicy.DESTROY,
@@ -45,9 +48,7 @@ export class AuthStack extends Stack {
 
     const userPoolClient = new cognito.UserPoolClient(this, "UserPoolClient", {
       userPool,
-      readAttributes: new cognito.ClientAttributes()
-        .withStandardAttributes({ email: true, emailVerified: true })
-        .withCustomAttributes("custom:userId", "custom:tenantId"),
+      readAttributes: new cognito.ClientAttributes().withStandardAttributes({ email: true, emailVerified: true }),
       writeAttributes: new cognito.ClientAttributes().withStandardAttributes({ email: true }),
     })
 
@@ -56,36 +57,61 @@ export class AuthStack extends Stack {
 
     this.userPool = userPool
 
-    const deadLetterQueue = new sqs.Queue(this, "DeadLetterQueue")
-    const preSignUpEventQueue = new sqs.Queue(this, "PreSignUpEventQueue", {
-      deadLetterQueue: {
-        maxReceiveCount: 1,
-        queue: deadLetterQueue,
-      },
+    const userTable = new dynamodb.Table(this, "UserTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      stream: dynamodb.StreamViewType.NEW_IMAGE,
+      // Only for development
+      removalPolicy: RemovalPolicy.DESTROY,
     })
 
     const preSignUpTrigger = new nodejs.NodejsFunction(this, "PreSignUpTrigger", {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: path.join(__dirname, "../src/pre-sign-up-trigger.ts"),
       handler: "handler",
+      architecture: lambda.Architecture.X86_64,
       logRetention: logs.RetentionDays.ONE_MONTH,
       environment: {
-        QUEUE_URL: preSignUpEventQueue.queueUrl,
+        USER_TABLE_NAME: userTable.tableName,
       },
+      description: "Updated at: 2024-03-11T08:17:54.765Z",
     })
-    preSignUpEventQueue.grantSendMessages(preSignUpTrigger)
-
-    const customAttributeHandler = new nodejs.NodejsFunction(this, "CustomAttributeHandler", {
-      runtime: lambda.Runtime.NODEJS_20_X,
-      entry: path.join(__dirname, "../src/custom-attribute-handler.ts"),
-      handler: "handler",
-      logRetention: logs.RetentionDays.ONE_MONTH,
-      description: `Created at: ${new Date().toISOString()}`,
-    })
-    customAttributeHandler.addEventSource(new eventSources.SqsEventSource(preSignUpEventQueue))
-    preSignUpEventQueue.grantConsumeMessages(customAttributeHandler)
-    userPool.grant(customAttributeHandler, "cognito-idp:AdminUpdateUserAttributes")
-
     userPool.addTrigger(cognito.UserPoolOperation.PRE_SIGN_UP, preSignUpTrigger)
+    userTable.grantWriteData(preSignUpTrigger)
+
+    const signUpStreamsHandler = new nodejs.NodejsFunction(this, "SignUpStreamsHandler", {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: path.join(__dirname, "../src/sign-up-streams-handler.ts"),
+      handler: "handler",
+      architecture: lambda.Architecture.X86_64,
+      logRetention: logs.RetentionDays.ONE_MONTH,
+      environment: {
+        USER_POOL_ID: userPool.userPoolId,
+      },
+      description: "Updated at: 2024-03-11T08:17:54.765Z",
+    })
+    userPool.grant(signUpStreamsHandler, "cognito-idp:AdminUpdateUserAttributes")
+    userTable.grantStreamRead(signUpStreamsHandler)
+    const dynamoEventSource = new eventSources.DynamoEventSource(userTable, {
+      startingPosition: lambda.StartingPosition.LATEST,
+      batchSize: 1,
+      retryAttempts: 3,
+      filters: [
+        lambda.FilterCriteria.filter({
+          eventName: lambda.FilterRule.isEqual("INSERT"),
+          dynamodb: {
+            NewImage: {
+              user_id: {
+                S: lambda.FilterRule.exists(),
+              },
+              tenant_id: {
+                S: lambda.FilterRule.exists(),
+              },
+            },
+          },
+        }),
+      ],
+    })
+    signUpStreamsHandler.addEventSource(dynamoEventSource)
   }
 }
